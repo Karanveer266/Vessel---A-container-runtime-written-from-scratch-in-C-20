@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  vesseld is typically reached in plaintext on a trusted path: loopback on the
+  same rooted device, `adb reverse` over USB, or the emulator host alias.
+  Android cannot scope cleartext permission to IP ranges (only domains), so
+  plaintext is permitted app-wide and the Connect screen instead *warns* when a
+  bearer token would be sent unencrypted to a non-loopback host. Enable TLS for
+  any LAN/WAN deployment.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <!-- Allows a self-signed vesseld CA installed by the user. -->
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

@@ -1,0 +1,397 @@
+// Vessel control-plane API.
+//
+// This file is the single contract shared by:
+//   * vesseld        (C++20 daemon, grpc++ sync server)
+//   * vesselctl      (C++20 CLI)
+//   * Vessel Console (Android app, grpc-kotlin + protobuf-javalite)
+//
+// Compatibility rules (enforced in review, see docs/API.md):
+//   * Field numbers are never reused; removed fields are `reserved`.
+//   * Enums always have an *_UNSPECIFIED = 0 value so that an old client
+//     talking to a new daemon degrades to "unknown" instead of mis-parsing.
+//   * Units are encoded in field names (_bytes, _usec, _ns, _millicores) so
+//     no consumer ever has to guess.
+syntax = "proto3";
+
+package vessel.v1;
+
+option java_multiple_files = true;
+option java_package = "dev.vessel.api.v1";
+option java_outer_classname = "VesselProto";
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+service Vessel {
+  // Host capabilities: kernel, cgroup flavour, eBPF availability, GPUs.
+  rpc GetHostInfo(GetHostInfoRequest) returns (HostInfo);
+
+  // Container lifecycle.
+  rpc CreateContainer(CreateContainerRequest) returns (Container);
+  rpc StartContainer(ContainerRef) returns (Container);
+  rpc StopContainer(StopContainerRequest) returns (Container);
+  rpc PauseContainer(ContainerRef) returns (Container);
+  rpc ResumeContainer(ContainerRef) returns (Container);
+  rpc RemoveContainer(RemoveContainerRequest) returns (RemoveContainerResponse);
+  rpc GetContainer(ContainerRef) returns (Container);
+  rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
+
+  // Run an additional process inside a running container (setns(2)).
+  rpc Exec(ExecRequest) returns (ExecResponse);
+
+  // Live telemetry. All streams are server-side bounded queues with a
+  // drop-oldest policy: a slow client (e.g. a phone on Wi-Fi) can never apply
+  // back-pressure to the tracer or the cgroup sampler. Dropped counts are
+  // reported in-band so the client knows it lost data.
+  rpc StreamStats(StreamStatsRequest) returns (stream StatsSample);
+  rpc StreamTrace(StreamTraceRequest) returns (stream TraceEvent);
+  rpc StreamLogs(StreamLogsRequest) returns (stream LogChunk);
+
+  // Aggregated (exact, never sampled) per-syscall counters for a container.
+  rpc GetSyscallSummary(ContainerRef) returns (SyscallSummary);
+
+  // Run a GPU workload (GEMM / FlashAttention / AllReduce) inside an
+  // ephemeral, resource-limited container with GPU device passthrough.
+  rpc RunGpuJob(GpuJobRequest) returns (GpuJobResult);
+}
+
+// ---------------------------------------------------------------------------
+// Host
+// ---------------------------------------------------------------------------
+message GetHostInfoRequest {}
+
+enum CgroupVersion {
+  CGROUP_VERSION_UNSPECIFIED = 0;
+  CGROUP_VERSION_V1 = 1;       // legacy per-controller hierarchies
+  CGROUP_VERSION_V2 = 2;       // unified hierarchy
+  CGROUP_VERSION_HYBRID = 3;   // v2 mounted but controllers bound to v1
+}
+
+enum TraceBackend {
+  TRACE_BACKEND_UNSPECIFIED = 0;
+  TRACE_BACKEND_NONE = 1;
+  TRACE_BACKEND_EBPF = 2;      // raw_tracepoint + cgroup_skb, ring buffer
+  TRACE_BACKEND_PTRACE = 3;    // portable fallback, PTRACE_SEIZE based
+  TRACE_BACKEND_AUTO = 4;      // eBPF if loadable, else ptrace
+}
+
+message GpuDevice {
+  int32 index = 1;
+  string name = 2;
+  uint64 total_memory_bytes = 3;
+  int32 sm_major = 4;
+  int32 sm_minor = 5;
+}
+
+message HostInfo {
+  string kernel_release = 1;
+  string machine = 2;
+  bool is_android = 3;
+  CgroupVersion cgroup_version = 4;
+  repeated string cgroup_controllers = 5;
+  bool ebpf_available = 6;
+  bool rootless = 7;
+  bool psi_available = 8;
+  repeated GpuDevice gpus = 9;
+  string daemon_version = 10;
+  uint32 online_cpus = 11;
+  uint64 total_memory_bytes = 12;
+  TraceBackend default_trace_backend = 13;
+}
+
+// ---------------------------------------------------------------------------
+// Container spec
+// ---------------------------------------------------------------------------
+enum NetworkMode {
+  NETWORK_MODE_UNSPECIFIED = 0;
+  NETWORK_MODE_NONE = 1;       // private netns, no interfaces up
+  NETWORK_MODE_LOOPBACK = 2;   // private netns, `lo` up (default)
+  NETWORK_MODE_HOST = 3;       // share the host netns (no CLONE_NEWNET)
+}
+
+enum SeccompProfile {
+  SECCOMP_PROFILE_UNSPECIFIED = 0;
+  SECCOMP_PROFILE_DEFAULT = 1;     // deny-list of dangerous syscalls
+  SECCOMP_PROFILE_STRICT = 2;      // default + no ptrace/bpf/perf/userfaultfd/...
+  SECCOMP_PROFILE_UNCONFINED = 3;
+}
+
+message ResourceLimits {
+  // CPU bandwidth in millicores (1000 = one full CPU). 0 = unlimited.
+  // Maps to cpu.max (v2) or cpu.cfs_quota_us / cpu.cfs_period_us (v1).
+  uint32 cpu_millicores = 1;
+  // Relative weight 1..10000 (v2 cpu.weight; v1 cpu.shares is scaled). 0 = default.
+  uint32 cpu_weight = 2;
+  // Hard memory limit. Exceeding it invokes the OOM killer inside the cgroup.
+  uint64 memory_max_bytes = 3;
+  // Soft limit: reclaim pressure + throttling above this value (v2 memory.high).
+  uint64 memory_high_bytes = 4;
+  // Maximum number of tasks (threads count!) in the cgroup. Fork-bomb guard.
+  uint32 pids_max = 5;
+  // Optional cpuset, e.g. "0-1" or "2,3". Empty = inherit.
+  string cpuset_cpus = 6;
+  // Disallow swap for deterministic latency (v2 memory.swap.max = 0).
+  bool disable_swap = 7;
+}
+
+message Mount {
+  string source = 1;        // host path
+  string target = 2;        // path inside the container
+  bool read_only = 3;
+}
+
+message IdMapping {
+  uint32 container_id = 1;
+  uint32 host_id = 2;
+  uint32 size = 3;
+}
+
+message ContainerSpec {
+  string name = 1;
+  string rootfs = 2;                 // host path of the root filesystem
+  repeated string args = 3;          // argv; args[0] resolved inside rootfs
+  repeated string env = 4;           // KEY=VALUE
+  string hostname = 5;
+  string working_dir = 6;
+  ResourceLimits limits = 7;
+  NetworkMode network = 8;
+  SeccompProfile seccomp = 9;
+  TraceBackend trace = 10;
+  repeated Mount mounts = 11;
+  bool read_only_rootfs = 12;
+  // User namespace mappings. Empty = daemon default (rootless: 0 -> euid).
+  repeated IdMapping uid_mappings = 13;
+  repeated IdMapping gid_mappings = 14;
+  // GPU indices to pass through (/dev/nvidiaN + control nodes).
+  repeated int32 gpu_devices = 15;
+  // Remove automatically when the workload exits.
+  bool auto_remove = 16;
+}
+
+// ---------------------------------------------------------------------------
+// Container state
+// ---------------------------------------------------------------------------
+enum ContainerState {
+  CONTAINER_STATE_UNSPECIFIED = 0;
+  CONTAINER_STATE_CREATED = 1;
+  CONTAINER_STATE_RUNNING = 2;
+  CONTAINER_STATE_PAUSED = 3;
+  CONTAINER_STATE_STOPPED = 4;   // exited (cleanly or not)
+  CONTAINER_STATE_FAILED = 5;    // never reached exec(2)
+}
+
+message Container {
+  string id = 1;                 // 12 hex chars
+  ContainerSpec spec = 2;
+  ContainerState state = 3;
+  int32 host_pid = 4;            // pid of the container's init in the host ns
+  int32 exit_code = 5;           // valid when STOPPED; 128+N for signal N
+  bool oom_killed = 6;
+  int64 created_at_unix_ns = 7;
+  int64 started_at_unix_ns = 8;
+  int64 finished_at_unix_ns = 9;
+  string cgroup_path = 10;
+  uint64 cgroup_id = 11;         // kernel cgroup id (what eBPF filters on)
+  TraceBackend active_trace_backend = 12;
+  string error = 13;             // set when FAILED
+}
+
+message ContainerRef { string id = 1; }   // id, unique id prefix, or name
+
+message CreateContainerRequest {
+  ContainerSpec spec = 1;
+  bool start = 2;                // create + start atomically
+}
+
+message StopContainerRequest {
+  string id = 1;
+  // Grace period before escalating SIGTERM -> cgroup-wide SIGKILL.
+  uint32 timeout_ms = 2;
+}
+
+message RemoveContainerRequest {
+  string id = 1;
+  bool force = 2;                // stop first if running
+}
+message RemoveContainerResponse {}
+
+message ListContainersRequest { bool all = 1; }   // include stopped
+message ListContainersResponse { repeated Container containers = 1; }
+
+message ExecRequest {
+  string id = 1;
+  repeated string args = 2;
+  repeated string env = 3;
+  uint32 timeout_ms = 4;         // 0 = 30 s default
+}
+message ExecResponse {
+  int32 exit_code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+  bool timed_out = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry
+// ---------------------------------------------------------------------------
+message StreamStatsRequest {
+  string id = 1;                 // empty = all running containers
+  uint32 interval_ms = 2;        // clamped to [100, 60000]; default 1000
+}
+
+message Psi {
+  float some_avg10 = 1;
+  float some_avg60 = 2;
+  float full_avg10 = 3;
+  uint64 some_total_usec = 4;
+}
+
+message StatsSample {
+  string container_id = 1;
+  int64 timestamp_unix_ns = 2;
+  uint64 cpu_usage_usec = 3;
+  uint64 cpu_user_usec = 4;
+  uint64 cpu_system_usec = 5;
+  uint64 cpu_nr_throttled = 6;
+  uint64 cpu_throttled_usec = 7;
+  // Derived by the daemon from successive samples: 1000 = one full CPU.
+  uint32 cpu_millicores_used = 8;
+  uint64 memory_current_bytes = 9;
+  uint64 memory_max_bytes = 10;  // 0 = unlimited
+  uint64 memory_peak_bytes = 11;
+  uint64 memory_events_high = 12;
+  uint64 memory_events_max = 13;
+  uint64 memory_events_oom = 14;
+  uint64 memory_events_oom_kill = 15;
+  uint32 pids_current = 16;
+  uint32 pids_max = 17;          // 0 = unlimited
+  Psi cpu_pressure = 18;
+  Psi memory_pressure = 19;
+  Psi io_pressure = 20;
+  uint64 net_rx_bytes = 21;      // from eBPF cgroup_skb when available
+  uint64 net_tx_bytes = 22;
+  uint64 dropped_samples = 23;   // stream back-pressure accounting
+}
+
+enum TraceEventKind {
+  TRACE_EVENT_KIND_UNSPECIFIED = 0;
+  TRACE_EVENT_KIND_SYSCALL = 1;        // completed syscall (enter+exit joined)
+  TRACE_EVENT_KIND_MEMORY = 2;         // mmap / munmap / brk / mremap
+  TRACE_EVENT_KIND_NET = 3;            // packet seen on the container cgroup
+  TRACE_EVENT_KIND_PROCESS_EXEC = 4;
+  TRACE_EVENT_KIND_PROCESS_EXIT = 5;
+  TRACE_EVENT_KIND_OOM_KILL = 6;       // from memory.events
+  TRACE_EVENT_KIND_MEMORY_PRESSURE = 7;// PSI trigger fired
+  TRACE_EVENT_KIND_SECCOMP_DENIED = 8; // syscall returned EPERM by our filter
+  TRACE_EVENT_KIND_LIFECYCLE = 9;      // created/started/paused/stopped
+}
+
+message TraceEvent {
+  string container_id = 1;
+  TraceEventKind kind = 2;
+  int64 timestamp_unix_ns = 3;
+  int32 host_pid = 4;            // tgid in the host pid namespace
+  int32 host_tid = 5;
+  string comm = 6;
+  int32 syscall_nr = 7;
+  string syscall_name = 8;
+  int64 ret = 9;                 // syscall return value (negative errno)
+  uint64 latency_ns = 10;
+  uint64 arg0 = 11;
+  uint64 arg1 = 12;
+  uint64 arg2 = 13;
+  uint64 bytes = 14;             // MEMORY: length; NET: packet length
+  bool egress = 15;              // NET direction
+  string detail = 16;            // human readable extra info
+  uint64 dropped_events = 17;    // events lost before this one (kernel+stream)
+  TraceBackend backend = 18;
+}
+
+message StreamTraceRequest {
+  string id = 1;                 // empty = all traced containers
+  repeated TraceEventKind kinds = 2;   // empty = all kinds
+  repeated string syscalls = 3;  // filter by syscall name; empty = all
+  uint64 min_latency_ns = 4;     // only syscalls slower than this
+  bool errors_only = 5;          // only syscalls with ret < 0
+}
+
+message SyscallCount {
+  string name = 1;
+  int32 nr = 2;
+  uint64 count = 3;
+  uint64 errors = 4;
+  uint64 total_latency_ns = 5;
+  uint64 max_latency_ns = 6;
+}
+message SyscallSummary {
+  string container_id = 1;
+  repeated SyscallCount syscalls = 2;   // sorted by count, descending
+  uint64 total_events = 3;
+  uint64 dropped_events = 4;
+  TraceBackend backend = 5;
+}
+
+message StreamLogsRequest {
+  string id = 1;
+  bool follow = 2;
+  uint32 tail_bytes = 3;         // 0 = whole retained buffer
+}
+message LogChunk {
+  enum Stream {
+    STREAM_UNSPECIFIED = 0;
+    STREAM_STDOUT = 1;
+    STREAM_STDERR = 2;
+  }
+  Stream stream = 1;
+  bytes data = 2;
+  int64 timestamp_unix_ns = 3;
+}
+
+// ---------------------------------------------------------------------------
+// GPU jobs
+// ---------------------------------------------------------------------------
+enum GpuOp {
+  GPU_OP_UNSPECIFIED = 0;
+  GPU_OP_GEMM = 1;               // C = A*B, fp32, custom tiled kernel
+  GPU_OP_GEMM_SPLITK_ALLREDUCE = 2;  // K split across ranks, ncclAllReduce(sum)
+  GPU_OP_FLASH_ATTENTION = 3;    // fused softmax(QK^T/sqrt(d))V, online softmax
+  GPU_OP_ALLREDUCE_BENCH = 4;    // bus bandwidth of ncclAllReduce
+}
+
+enum GpuBackend {
+  GPU_BACKEND_UNSPECIFIED = 0;
+  GPU_BACKEND_CUDA = 1;          // real GPUs, real NCCL
+  GPU_BACKEND_SIMULATED = 2;     // CPU ranks + ring all-reduce (same algorithm)
+  GPU_BACKEND_AUTO = 3;
+}
+
+message GpuJobRequest {
+  GpuOp op = 1;
+  GpuBackend backend = 2;
+  uint32 m = 3;
+  uint32 n = 4;
+  uint32 k = 5;
+  uint32 ranks = 6;              // number of GPUs / simulated ranks
+  // FlashAttention shape: batch*heads, sequence length, head dim.
+  uint32 batch_heads = 7;
+  uint32 seq_len = 8;
+  uint32 head_dim = 9;
+  bool causal = 10;
+  uint32 iterations = 11;
+  bool verify = 12;              // compare against CPU reference
+  ResourceLimits limits = 13;    // sandbox limits for the job container
+  string rootfs = 14;            // optional; daemon default otherwise
+}
+
+message GpuJobResult {
+  bool ok = 1;
+  string error = 2;
+  GpuBackend backend = 3;
+  double time_ms = 4;            // mean per iteration
+  double gflops = 5;
+  double bus_bandwidth_gbps = 6; // ALLREDUCE_BENCH / SPLITK
+  double max_abs_error = 7;
+  string container_id = 8;
+  string device_names = 9;
+  map<string, string> metrics = 10;  // raw key/values from the worker
+}

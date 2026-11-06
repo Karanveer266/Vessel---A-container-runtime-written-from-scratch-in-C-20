@@ -1,0 +1,14 @@
+build*/
+cmake-build-*/
+compile_commands.json
+.cache/
+*.bpf.o
+*.skel.h
+.idea/
+.vscode/
+# Android
+android/.gradle/
+android/build/
+android/**/build/
+android/local.properties
+*.apk

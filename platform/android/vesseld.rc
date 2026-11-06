@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# init.rc fragment for building vesseld into a device image (AOSP vendor/
+# product partition). Install as /vendor/etc/init/vesseld.rc together with the
+# binary at /vendor/bin/vesseld and the SELinux policy in sepolicy/.
+#
+# For development on a rooted device use scripts/android-deploy.sh instead.
+
+service vesseld /vendor/bin/vesseld \
+        --listen 127.0.0.1:50051 \
+        --state-dir /data/vendor/vessel \
+        --rootfs /data/vendor/vessel/rootfs
+    class late_start
+    user root
+    group root
+    # namespaces + cgroups + bpf
+    capabilities SYS_ADMIN SYS_PTRACE SYS_RESOURCE NET_ADMIN KILL SETUID SETGID SETPCAP DAC_OVERRIDE CHOWN FOWNER BPF PERFMON
+    disabled
+    oneshot_off
+
+on post-fs-data
+    mkdir /data/vendor/vessel 0700 root root
+
+on property:persist.vendor.vessel.enabled=1
+    start vesseld

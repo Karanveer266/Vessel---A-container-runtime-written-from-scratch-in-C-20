@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# Sketch of the SELinux domain for vesseld on a userdebug/eng build.
+# A production policy must be narrowed per device (genfs labels of the
+# cgroup mounts differ between vendors). Listed here to document exactly
+# which kernel facilities the daemon touches.
+type vesseld, domain;
+type vesseld_exec, exec_type, vendor_file_type, file_type;
+init_daemon_domain(vesseld)
+
+# namespaces: clone/unshare/setns, pivot_root, mount of proc/tmpfs/devpts
+allow vesseld self:capability { sys_admin sys_ptrace sys_resource net_admin kill setuid setgid setpcap dac_override chown fowner };
+allow vesseld self:cap_userns { sys_admin setuid setgid setpcap net_admin chown dac_override fowner kill };
+allow vesseld self:user_namespace create;
+allow vesseld proc:filesystem mount;
+allow vesseld tmpfs:filesystem mount;
+allow vesseld labeledfs:filesystem { mount unmount };
+
+# cgroups (Android: memcg at /dev/memcg, cpuctl at /dev/cpuctl, v2 at /sys/fs/cgroup)
+allow vesseld cgroup:dir create_dir_perms;
+allow vesseld cgroup:file rw_file_perms;
+allow vesseld cgroup_v2:dir create_dir_perms;
+allow vesseld cgroup_v2:file rw_file_perms;
+
+# eBPF tracer
+allow vesseld self:capability2 { bpf perfmon };
+allow vesseld self:bpf { map_create map_read map_write prog_load prog_run };
+allow vesseld fs_bpf:dir search;
+
+# ptrace backend
+allow vesseld self:process { ptrace setcap setpgid sigkill signal };
+
+# gRPC on loopback / LAN
+allow vesseld self:tcp_socket create_stream_socket_perms;
+allow vesseld port:tcp_socket name_bind;
+allow vesseld node:tcp_socket node_bind;

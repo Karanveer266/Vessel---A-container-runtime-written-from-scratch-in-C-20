@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Vessel container daemon
+Documentation=https://github.com/vessel-runtime/vessel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vesseld --listen unix:///run/vessel/vessel.sock
+# Hand vesseld its own cgroup subtree. With Delegate=yes systemd will not
+# touch cgroups below vesseld.service, which is what makes it legal for the
+# daemon to enable controllers and create per-container children (cgroup v2
+# delegation model; see details.md "cgroups").
+Delegate=yes
+KillMode=mixed
+# Containers must not be killed by systemd's stop logic before vesseld has a
+# chance to stop them gracefully.
+TimeoutStopSec=30
+Restart=on-failure
+RuntimeDirectory=vessel
+RuntimeDirectoryMode=0700
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
